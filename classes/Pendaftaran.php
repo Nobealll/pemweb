@@ -1,87 +1,182 @@
+
 <?php
 
 class Pendaftaran
 {
-    private mysqli $koneksi;
+    private mysqli $db;
 
-    public function __construct(mysqli $koneksi)
+    public function __construct(mysqli $db)
     {
-        $this->koneksi = $koneksi;
+        $this->db = $db;
     }
 
-    public function daftarMahasiswaKeKelas(Mahasiswa $mahasiswa, Kelas $kelas): void
-    {
-        $kelasId = $kelas->id;
-        if ($kelasId < 1) {
-            throw new InvalidArgumentException('Kelas yang dipilih tidak valid.');
-        }
-
-        $this->koneksi->begin_transaction();
-
+    public function daftarMahasiswaKeKelas(
+        Mahasiswa $mahasiswa,
+        int $kelas_id
+    ): bool {
         try {
-            $stmt = $this->koneksi->prepare('SELECT id FROM mahasiswa WHERE id = ?');
-            $stmt->bind_param('s', $mahasiswa->id);
-            $stmt->execute();
-            $mahasiswaAda = $stmt->get_result()->fetch_assoc() !== null;
+            $this->db->begin_transaction();
 
-            if ($mahasiswaAda) {
-                $stmt = $this->koneksi->prepare('SELECT nama FROM mahasiswa WHERE id = ?');
-                $stmt->bind_param('s', $mahasiswa->id);
-                $stmt->execute();
-                $dataMahasiswa = $stmt->get_result()->fetch_assoc();
-                if ($dataMahasiswa['nama'] !== $mahasiswa->nama) {
-                    throw new RuntimeException('Nama tidak sesuai dengan ID mahasiswa tersebut.');
-                }
-            } else {
-                $stmt = $this->koneksi->prepare('INSERT INTO mahasiswa (id, nama) VALUES (?, ?)');
-                $stmt->bind_param('ss', $mahasiswa->id, $mahasiswa->nama);
-                $stmt->execute();
-            }
-
-            $stmt = $this->koneksi->prepare('SELECT kapasitas FROM kelas WHERE id = ? FOR UPDATE');
-            $stmt->bind_param('i', $kelasId);
-            $stmt->execute();
-            $kelas = $stmt->get_result()->fetch_assoc();
-            if ($kelas === null) {
-                throw new RuntimeException('Kelas tidak ditemukan.');
-            }
-
-            $stmt = $this->koneksi->prepare(
-                'SELECT COUNT(*) AS jumlah FROM pendaftaran WHERE kelas_id = ?'
+            // Kunci baris kelas selama proses pendaftaran.
+            $query = $this->db->prepare(
+                "SELECT id, kapasitas
+                FROM kelas
+                WHERE id = ?
+                FOR UPDATE"
             );
-            $stmt->bind_param('i', $kelasId);
-            $stmt->execute();
-            $jumlah = (int) $stmt->get_result()->fetch_assoc()['jumlah'];
+            $query->bind_param("i", $kelas_id);
+            $query->execute();
+
+            $kelas = $query->get_result()->fetch_assoc();
+
+            if (!$kelas) {
+                throw new RuntimeException(
+                    "Kelas tidak ditemukan."
+                );
+            }
+
+            // Periksa apakah mahasiswa sudah terdaftar.
+            $query = $this->db->prepare(
+                "SELECT id FROM pendaftaran
+                WHERE mahasiswa_id = ? AND kelas_id = ?"
+            );
+            $query->bind_param(
+                "ii",
+                $mahasiswa->id,
+                $kelas_id
+            );
+            $query->execute();
+
+            if ($query->get_result()->num_rows > 0) {
+                throw new RuntimeException(
+                    "Mahasiswa sudah terdaftar di kelas ini."
+                );
+            }
+
+            // Hitung jumlah pendaftar yang sebenarnya.
+            $query = $this->db->prepare(
+                "SELECT COUNT(*) AS total
+                FROM pendaftaran
+                WHERE kelas_id = ?"
+            );
+            $query->bind_param("i", $kelas_id);
+            $query->execute();
+
+            $jumlah = (int) $query->get_result()
+                ->fetch_assoc()['total'];
+
             if ($jumlah >= (int) $kelas['kapasitas']) {
-                throw new RuntimeException('Kelas sudah penuh dan tidak menerima pendaftaran baru.');
+                throw new RuntimeException(
+                    "Pendaftaran gagal. Kelas sudah penuh."
+                );
             }
 
-            $stmt = $this->koneksi->prepare(
-                'INSERT INTO pendaftaran (mahasiswa_id, kelas_id) VALUES (?, ?)'
+            // Simpan pendaftaran.
+            $query = $this->db->prepare(
+                "INSERT INTO pendaftaran
+                 (mahasiswa_id, kelas_id)
+                 VALUES (?, ?)"
             );
-            $stmt->bind_param('si', $mahasiswa->id, $kelasId);
-            $stmt->execute();
-            $this->koneksi->commit();
-        } catch (Throwable $error) {
-            $this->koneksi->rollback();
-            throw $error;
+            $query->bind_param(
+                "ii",
+                $mahasiswa->id,
+                $kelas_id
+            );
+            $query->execute();
+
+            // Perbarui jumlah pendaftar.
+            $jumlah++;
+
+            $query = $this->db->prepare(
+                "UPDATE kelas
+                 SET jumlah_daftar = ?
+                 WHERE id = ?"
+            );
+            $query->bind_param(
+                "ii",
+                $jumlah,
+                $kelas_id
+            );
+            $query->execute();
+
+            $this->db->commit();
+
+            return true;
+
+        } catch (Throwable $e) {
+            $this->db->rollback();
+            throw $e;
         }
     }
 
-    public function batalkanPendaftaran(Mahasiswa $mahasiswa, Kelas $kelas): void
-    {
-        $kelasId = $kelas->id;
-        if ($kelasId < 1) {
-            throw new InvalidArgumentException('Kelas yang dipilih tidak valid.');
-        }
+    public function batalkanPendaftaran(
+        Mahasiswa $mahasiswa,
+        int $kelas_id
+    ): bool {
+        try {
+            $this->db->begin_transaction();
 
-        $stmt = $this->koneksi->prepare(
-            'DELETE FROM pendaftaran WHERE mahasiswa_id = ? AND kelas_id = ?'
-        );
-        $stmt->bind_param('si', $mahasiswa->id, $kelasId);
-        $stmt->execute();
-        if ($stmt->affected_rows === 0) {
-            throw new RuntimeException('Pendaftaran tidak ditemukan.');
+            $query = $this->db->prepare(
+                "SELECT id FROM kelas
+                 WHERE id = ? FOR UPDATE"
+            );
+            $query->bind_param("i", $kelas_id);
+            $query->execute();
+
+            if (!$query->get_result()->fetch_assoc()) {
+                throw new RuntimeException(
+                    "Kelas tidak ditemukan."
+                );
+            }
+
+            $query = $this->db->prepare(
+                "DELETE FROM pendaftaran
+                 WHERE mahasiswa_id = ? AND kelas_id = ?"
+            );
+            $query->bind_param(
+                "ii",
+                $mahasiswa->id,
+                $kelas_id
+            );
+            $query->execute();
+
+            if ($query->affected_rows === 0) {
+                throw new RuntimeException(
+                    "Pendaftaran tidak ditemukan."
+                );
+            }
+
+            // Hitung ulang jumlah pendaftar.
+            $query = $this->db->prepare(
+                "SELECT COUNT(*) AS total
+                 FROM pendaftaran
+                 WHERE kelas_id = ?"
+            );
+            $query->bind_param("i", $kelas_id);
+            $query->execute();
+
+            $jumlah = (int) $query->get_result()
+                ->fetch_assoc()['total'];
+
+            $query = $this->db->prepare(
+                "UPDATE kelas
+                 SET jumlah_daftar = ?
+                 WHERE id = ?"
+            );
+            $query->bind_param(
+                "ii",
+                $jumlah,
+                $kelas_id
+            );
+            $query->execute();
+
+            $this->db->commit();
+
+            return true;
+
+        } catch (Throwable $e) {
+            $this->db->rollback();
+            throw $e;
         }
     }
 }
